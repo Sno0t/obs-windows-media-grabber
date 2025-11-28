@@ -560,17 +560,31 @@ namespace MediaInfoGrabber
     <meta name=""viewport"" content=""width=device-width, initial-scale=1"" />
     <title>Now Playing Overlay</title>
     <link rel=""stylesheet"" href=""overlay.css"" />
+    <script src=""https://cdn.jsdelivr.net/npm/davidshimjs-qrcodejs@0.0.2/qrcode.min.js""></script>
 </head>
 <body>
     <div id=""player"" data-anim=""none"">
-        <div id=""cover-container"">
-            <img id=""cover"" alt="""" />
-            <div id=""pause-overlay"" style=""z-index:5;"">
-                <div id=""pause-icon""></div>
-            </div>
+        <!-- Optional Title Bar -->
+        <div id=""title-bar"">
+            <span id=""title-bar-text""></span>
         </div>
+        
+        <div id=""content-wrapper"">
+            <div id=""cover-container"">
+                <img id=""cover"" alt="""" />
+                <div id=""pause-overlay"" style=""z-index:5;"">
+                    <div id=""pause-icon""></div>
+                </div>
+            </div>
+            
+            <div id=""qr-code-container"">
+                <div id=""qr-code""></div>
+            </div>
 
-        <div id=""meta"">
+            <div id=""meta"">
+
+            <div id=""qr-text""></div>
+
             <div id=""title"" class=""line"">
                 <div class=""scroll""><span></span><span class=""clone""></span></div>
                 <div class=""ellipsis""></div>
@@ -596,6 +610,7 @@ namespace MediaInfoGrabber
                 <span id=""elapsed"">0:00</span>
                 <span id=""duration"">0:00</span>
             </div>
+        </div>
         </div>
     </div>
 
@@ -671,6 +686,22 @@ body.use-fade #player.is-leaving.fx  { animation: flyOut var(--anim-dur) cubic-b
     --skip-settle-ms: 0;         /* time to wait before committing to a track */
     --enrich-meta: 1;            /* metadata enrichment (1 = enabled, 0 = disabled) */
     --poll-ms: 500;              /* polling interval */
+
+    /* ========== Title Bar Configuration ========== */
+    --title-bar-text: '';                           /* Empty = hidden, 'Your text here' = shown */
+    --title-bar-height: calc(var(--cover-size) * 0.15);  /* 60px when cover-size is 400px */
+    --title-bar-font-size: calc(var(--font-base) * 1.2);
+    --title-bar-bg: rgba(0,0,0,.6);
+    --title-bar-color: var(--fg);
+    --title-bar-align: center;                      /* left | center | right */
+
+    /* ========== QR Code Configuration ========== */
+    --qr-enabled: 0;                                /* 0 = disabled, 1 = enabled */
+    --qr-url: '';                                   /* URL/text to encode */
+    --qr-text: 'Scan to join!';                     /* Text below QR code */
+    --qr-music-interval-ms: 8000;                   /* Show music for X ms before switching to QR */
+    --qr-interval-ms: 8000;                         /* Show QR for X ms before switching back */
+    --qr-fade-dur: 400ms;                           /* Fade transition duration */
 }
 
 * { box-sizing: border-box; }
@@ -680,30 +711,101 @@ html, body {
     font-family: Inter, Segoe UI, Arial, sans-serif; color: var(--fg);
 }
 
+/* ===========================================
+   Title Bar (inside player)
+   =========================================== */
+#title-bar {
+    display: none;
+    width: 100%;
+    font-size: var(--title-bar-font-size);
+    font-weight: 600;
+    padding-bottom: calc(var(--cover-size) * 0.04);
+    margin-bottom: calc(var(--cover-size) * 0.04);
+    border-bottom: 1px solid rgba(255,255,255,.1);
+    color: var(--title-bar-color);
+    text-align: var(--title-bar-align);
+    -webkit-font-smoothing: antialiased;
+}
+
+#title-bar.show {
+    display: block;
+}
+
 /* NO transitions — only keyframe animations */
 #player {
     width: min(var(--w), 100vw);
     min-height: var(--h);
-    display: flex; align-items: center; gap: var(--gap);
+    display: flex;
+    flex-direction: column;
     padding: var(--pad);
-    border-radius: calc(var(--cover-size) * 0.08); /* 20px when cover-size is 250px */
-    background: var(--bg); box-shadow: var(--shadow);
-    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+    border-radius: calc(var(--cover-size) * 0.08);
+    background: var(--bg);
+    box-shadow: var(--shadow);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    position: relative;
 }
 
-/* Layout */
-#cover-container {
+/* Content wrapper for horizontal layout */
+#content-wrapper {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--gap);
+    flex: 1;
+    position: relative;
+}
+
+/* Layout - shared by cover and qr-code containers */
+#cover-container,
+#qr-code-container {
     width: var(--cover-size); 
     height: var(--cover-size);
-    position: relative; 
+    position: absolute;
+    left: 0;
+    top: 0;
     border-radius: calc(var(--cover-size) * 0.048);
     overflow: hidden;
     flex-shrink: 0;
-    
+    transition: opacity var(--qr-fade-dur) ease;
+}
+
+#cover-container {
     /* Always show fallback background */
-    background: linear-gradient(135deg, rgba(255,255,255,.12), rgba(255,255,255,.06));
-    border: 1px solid rgba(255,255,255,.1);
-    display: block;
+    background: linear-gradient(135deg,
+        rgba(255,255,255,0.05) 0%,
+        rgba(255,255,255,0.02) 100%
+    );
+    opacity: 1;
+    z-index: 1;
+}
+
+#qr-code-container {
+    background: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: calc(var(--cover-size) * 0.05);
+    opacity: 0;
+    z-index: 2;
+}
+
+#qr-code {
+    display: inline-block;
+}
+
+/* Wrapper for cover containers to maintain space */
+#content-wrapper > #cover-container,
+#content-wrapper > #qr-code-container {
+    position: absolute;
+}
+
+/* Spacer to maintain layout */
+#content-wrapper::before {
+    content: '';
+    width: var(--cover-size);
+    height: var(--cover-size);
+    flex-shrink: 0;
 }
 
 /* Always show the music note */
@@ -780,6 +882,7 @@ html, body {
 
 #meta {
     flex: 1 1 auto;
+    min-width: 0;
     display: grid;
     grid-template-rows: 
         calc(var(--font-title) * 1.9)   /* Title row */
@@ -788,7 +891,7 @@ html, body {
         calc(var(--font-extra) * 1.6)   /* Extra metadata row */
         auto auto;                       /* Progress and time rows */
     align-content: center;
-    min-width: 0;
+    position: relative;
 }
 
 .line { position: relative; min-height: 1em; width: 100%; min-width: 0; }
@@ -865,6 +968,59 @@ html, body {
     color: var(--sub); 
     margin-top: calc(var(--cover-size) * 0.04);
 }
+
+/* ===========================================
+   QR Code Display Toggle (Fade Effect)
+   =========================================== */
+
+#qr-text {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    font-size: calc(var(--font-title) * 1.33);
+    font-weight: 600;
+    color: var(--fg);
+    line-height: 1.4;
+    opacity: 0;
+    z-index: 2;
+    transition: opacity var(--qr-fade-dur) ease;
+    pointer-events: none;
+}
+
+/* Meta children */
+#meta > .line,
+#meta > #extra,
+#meta > #bar,
+#meta > #times {
+    transition: opacity var(--qr-fade-dur) ease;
+    z-index: 1;
+}
+
+/* Toggle between music and QR views with smooth crossfade */
+#player.show-qr #cover-container {
+    opacity: 0;
+}
+
+#player.show-qr #qr-code-container {
+    opacity: 1;
+}
+
+/* Hide meta children when showing QR */
+#player.show-qr #meta > .line,
+#player.show-qr #meta > #extra,
+#player.show-qr #meta > #bar,
+#player.show-qr #meta > #times {
+    opacity: 0;
+}
+
+#player.show-qr #qr-text {
+    opacity: 1;
+    pointer-events: auto;
+}
               ";
               
               
@@ -883,6 +1039,8 @@ const $ = (sel) => document.querySelector(sel);
 const ui = {
     body: document.body,
     player: $('#player'),
+    titleBar: $('#title-bar'),
+    titleBarText: $('#title-bar-text'),
     coverWrap: $('#cover-container'),
     cover: $('#cover'),
     pauseOverlay: $('#pause-overlay'),
@@ -893,6 +1051,8 @@ const ui = {
     duration: $('#duration'),
     progressBar: $('#progress'),
     extraLine: $('#extra'),
+    qrCode: $('#qr-code'),
+    qrText: $('#qr-text'),
 };
 
 //////////////////// Config (CSS vars + URL) ////////////////////
@@ -917,6 +1077,13 @@ function loadConfig() {
         intervalMs:   parseMs(getCssVar('--interval-ms', '0')),
         pollMs:       parseMs(getCssVar('--poll-ms', '1000ms')),
         settleMs:     parseMs(getCssVar('--skip-settle-ms', '0ms')),
+        titleBarText: getCssVar('--title-bar-text', '').replace(/^[""']|[""']$/g, ''),
+        titleBarAlign: getCssVar('--title-bar-align', 'center'),
+        qrEnabled:    parseInt(getCssVar('--qr-enabled', '0')) === 1,
+        qrUrl:        getCssVar('--qr-url', '').replace(/^[""']|[""']$/g, ''),
+        qrText:       getCssVar('--qr-text', 'Scan to join!').replace(/^[""']|[""']$/g, ''),
+        qrMusicMs:    parseMs(getCssVar('--qr-music-interval-ms', '8000')),
+        qrIntervalMs: parseMs(getCssVar('--qr-interval-ms', '8000')),
     };
     return {
         anim:       urlParams.get('anim')    || (cssDefaults.anim !== 'none' ? cssDefaults.anim : null),
@@ -929,6 +1096,13 @@ function loadConfig() {
         settleMs:   urlParams.has('settle')   ? Math.max(0, +urlParams.get('settle'))   : cssDefaults.settleMs,
         textMode:   { title: 'marquee', artist: 'ellipsis', album: 'ellipsis' },
         marquee:    { pxPerSec: 60, gapPx: 24 },
+        titleBarText: urlParams.get('title') || cssDefaults.titleBarText,
+        titleBarAlign: urlParams.get('titlealign') || cssDefaults.titleBarAlign,
+        qrEnabled:    urlParams.has('qr') ? urlParams.get('qr') === 'true' : cssDefaults.qrEnabled,
+        qrUrl:        urlParams.get('qrurl') || cssDefaults.qrUrl,
+        qrText:       urlParams.get('qrtext') || cssDefaults.qrText,
+        qrMusicMs:    urlParams.has('qrmusic') ? Math.max(0, +urlParams.get('qrmusic')) : cssDefaults.qrMusicMs,
+        qrIntervalMs: urlParams.has('qrinterval') ? Math.max(0, +urlParams.get('qrinterval')) : cssDefaults.qrIntervalMs,
     };
 }
 let CFG = loadConfig();
@@ -949,8 +1123,45 @@ function isPausedLike(d) {
     return d && (d.status === 'Paused' || d.is_playing === false);
 }
 function isVisible() {
-    // Treat as visible if display is not 'none'
     return getComputedStyle(ui.player).display !== 'none';
+}
+
+//////////////////// Title Bar ////////////////////
+function updateTitleBar() {
+    if (CFG.titleBarText) {
+        ui.titleBarText.textContent = CFG.titleBarText;
+        ui.titleBar.classList.add('show');
+        ui.player.classList.add('has-title');
+    } else {
+        ui.titleBar.classList.remove('show');
+        ui.player.classList.remove('has-title');
+    }
+}
+
+//////////////////// QR Code Generation ////////////////////
+let qrCodeInstance = null;
+
+function generateQR(text) {
+    if (!text || typeof QRCode === 'undefined') return;
+    
+    try {
+        // Clear existing QR code
+        ui.qrCode.innerHTML = '';
+        
+        // Generate new QR code
+        qrCodeInstance = new QRCode(ui.qrCode, {
+            text: text,
+            width: 290,
+            height: 290,
+            colorDark: '#000000',
+            colorLight: '#ffffff',
+            correctLevel: QRCode.CorrectLevel.H
+        });
+        
+        ui.qrText.textContent = CFG.qrText;
+    } catch (err) {
+        console.error('QR generation failed:', err);
+    }
 }
 
 //////////////////// Lean Animation (CSS-driven) ////////////////////
@@ -1231,7 +1442,17 @@ class NowPlayingApp {
         this.currentTrack = null;
         this.durationTimer = null;
         this.intervalTimer = null;
+        this.qrTimer = null;
+        this.showingQR = false;
+        
         setFadeClass();
+        updateTitleBar();
+        
+        // Initialize QR if enabled
+        if (CFG.qrEnabled && CFG.qrUrl) {
+            generateQR(CFG.qrUrl);
+        }
+        
         this.startPolling();
     }
 
@@ -1242,6 +1463,26 @@ class NowPlayingApp {
     stopTimers() {
         if (this.durationTimer) { clearTimeout(this.durationTimer); this.durationTimer = null; }
         if (this.intervalTimer) { clearTimeout(this.intervalTimer); this.intervalTimer = null; }
+        if (this.qrTimer) { clearTimeout(this.qrTimer); this.qrTimer = null; }
+    }
+
+    showQR() {
+        if (!CFG.qrEnabled || !CFG.qrUrl) return;
+        this.showingQR = true;
+        ui.player.classList.add('show-qr');
+        
+        if (CFG.qrIntervalMs > 0) {
+            this.qrTimer = setTimeout(() => this.hideQR(), CFG.qrIntervalMs);
+        }
+    }
+
+    hideQR() {
+        this.showingQR = false;
+        ui.player.classList.remove('show-qr');
+        
+        if (CFG.qrEnabled && CFG.qrUrl && CFG.qrMusicMs > 0) {
+            this.qrTimer = setTimeout(() => this.showQR(), CFG.qrMusicMs);
+        }
     }
 
     startTimersAfterInitialShow() {
@@ -1254,6 +1495,11 @@ class NowPlayingApp {
             }, CFG.durationMs);
         } else if (CFG.intervalMs > 0) {
             this.intervalTimer = setTimeout(() => this.forceRefresh(), CFG.intervalMs);
+        }
+
+        // Start QR cycle if enabled
+        if (CFG.qrEnabled && CFG.qrUrl && CFG.qrMusicMs > 0 && !this.showingQR) {
+            this.qrTimer = setTimeout(() => this.showQR(), CFG.qrMusicMs);
         }
     }
 
@@ -1271,7 +1517,13 @@ class NowPlayingApp {
         // Keep config dynamic
         CFG = loadConfig();
         setFadeClass();
+        updateTitleBar();
         ui.player.setAttribute('data-anim', CFG.anim || 'none');
+
+        // Re-generate QR if config changed
+        if (CFG.qrEnabled && CFG.qrUrl) {
+            generateQR(CFG.qrUrl);
+        }
 
         if (!isPlayable(data)) {
             this.stopTimers();
@@ -1300,6 +1552,10 @@ class NowPlayingApp {
             // reset cover only on real track change
             ui.coverWrap.classList.remove('has-cover');
             ui.cover.removeAttribute('src');
+
+            // Reset to music view
+            this.showingQR = false;
+            ui.player.classList.remove('show-qr');
 
             ensureCover();
             applyStaticTrackData(data);
@@ -1424,13 +1680,13 @@ public static string CompactHtml = @"<!doctype html>
   </html>
   ";
   
-public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
+public static string UsageMd = @"# 🎨 MediaInfoGrabber Widget Customization Guide
   
   This guide explains how to customize the media overlay widget to fit your specific needs.
   
-  ## Quick Start
+  ## 🚀 Quick Start
   
-  The widget is controlled entirely through CSS variables in the `:root` section (or controlled by uri parameters, see further below). 
+  The widget is controlled entirely through CSS variables in the `:root` section (or controlled by URI parameters, see further below). 
   Change these values to customize appearance and behavior:
   
   ```css
@@ -1442,7 +1698,7 @@ public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
   }
   ```
   
-  ## Master Scaling System
+  ## 📐 Master Scaling System
   
   Everything scales from the cover size for consistent proportions:
   
@@ -1457,7 +1713,7 @@ public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
   - Widget height: `cover-size × 1`
   - All fonts, spacing, and elements scale proportionally
   
-  ## Animation Configuration
+  ## 🎬 Animation Configuration
   
   ### Animation Types
   ```css
@@ -1481,7 +1737,7 @@ public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
   --interval-ms: 10000;     /* Repeat every 10 seconds (0 = no repeat) */
   ```
   
-  ## Track Change Behavior
+  ## ⏱️ Track Change Behavior
   
   ```css
   --skip-settle-ms: 1250;   /* Wait time before showing new track */
@@ -1489,7 +1745,58 @@ public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
   
   When tracks change rapidly (skipping songs), the widget waits before updating to avoid flickering. Set to `0` for immediate updates.
   
-  ## Visual Customization
+  ## 🏷️ Title Bar (NEW)
+  
+  Add an optional title bar above the widget with custom text and alignment:
+  
+  ```css
+  --title-bar-text: 'Now Playing';           /* Empty = hidden, 'text' = shown */
+  --title-bar-align: center;                 /* left | center | right */
+  --title-bar-font-size: calc(var(--font-base) * 1.2);
+  --title-bar-color: var(--fg);
+  ```
+  
+  **URL Parameters:**
+  - `title` - Title bar text
+  - `titlealign` - Alignment (left/center/right)
+  
+  **Example:**
+  ```
+  overlay.html?title=Stream%20Overlay&titlealign=left
+  ```
+  
+  ## 📲 QR Code Display (NEW)
+  
+  Toggle between music info and a QR code with smooth fade transitions:
+  
+  ```css
+  --qr-enabled: 1;                           /* 0 = disabled, 1 = enabled */
+  --qr-url: 'https://spotify.com/...';       /* URL or text to encode */
+  --qr-text: 'Scan to follow!';              /* Text displayed next to QR */
+  --qr-music-interval-ms: 8000;              /* Show music for X ms */
+  --qr-interval-ms: 8000;                    /* Show QR for X ms */
+  --qr-fade-dur: 400ms;                      /* Fade transition duration */
+  ```
+  
+  **URL Parameters:**
+  - `qr` - Enable QR code (true/false)
+  - `qrurl` - QR code URL or text
+  - `qrtext` - Display text
+  - `qrmusic` - Music display duration (ms)
+  - `qrinterval` - QR display duration (ms)
+  
+  **Example:**
+  ```
+  overlay.html?qr=true&qrurl=https://twitch.tv/yourname&qrtext=Follow%20me!&qrmusic=10000&qrinterval=5000
+  ```
+  
+  **Behavior:**
+  - Shows music info for `--qr-music-interval-ms`
+  - Fades to QR code for `--qr-interval-ms`
+  - Repeats cycle
+  - Set either interval to `0` to disable auto-switching
+  
+  ## 🎨 Visual Customization
   
   ### Colors & Theme
   ```css
@@ -1501,12 +1808,12 @@ public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
   --shadow: 0 5px 15px rgba(0,0,0,.5);  /* Drop shadow */
   ```
   
-  ## URL Parameters
+  ## 🔗 URL Parameters
   
   Override any setting via URL parameters for testing:
   
   ```
-  overlay.html?anim=fly-right&duration=3000&fade=200
+  overlay.html?anim=fly-right&duration=3000&fade=200&title=Now%20Playing
   ```
   
   **Available parameters:**
@@ -1517,10 +1824,16 @@ public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
   - `duration` - Auto-hide time (ms)
   - `interval` - Repeat interval (ms)
   - `settle` - Track settle time (ms)
-  - `enrich` - Metadata enrichment (true/false)
   - `poll` - Update frequency (ms)
+  - `title` - Title bar text (NEW)
+  - `titlealign` - Title alignment: left/center/right (NEW)
+  - `qr` - Enable QR: true/false (NEW)
+  - `qrurl` - QR code URL or text (NEW)
+  - `qrtext` - QR display text (NEW)
+  - `qrmusic` - Music display duration (ms) (NEW)
+  - `qrinterval` - QR display duration (ms) (NEW)
   
-  ## Common Use Cases
+  ## 💡 Common Use Cases
   
   ### Stream Overlay (Bottom Corner)
   ```css
@@ -1547,7 +1860,20 @@ public static string UsageMd = @"# MediaInfoGrabber Widget Customization Guide
   --interval-ms: 15000;
   ```
   
-  ## Integration Examples
+  ### Stream Overlay with QR Code
+  ```css
+  --cover-size: 350px;
+  --anim-type: fly-right;
+  --duration-ms: 0;                    /* Always visible */
+  --title-bar-text: 'Now Streaming';   /* Add title */
+  --qr-enabled: 1;                     /* Enable QR */
+  --qr-url: 'https://twitch.tv/yourname';
+  --qr-text: 'Follow me on Twitch!';
+  --qr-music-interval-ms: 12000;       /* Show music for 12s */
+  --qr-interval-ms: 5000;              /* Show QR for 5s */
+  ```
+  
+  ## 🔌 Integration Examples
   
   ### OBS Studio
   1. Add **Browser Source**
