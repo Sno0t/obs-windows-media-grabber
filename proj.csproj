@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- Assembly and executable name -->
+    <AssemblyName>MediaInfoGrabber</AssemblyName>
+    <StartupObject>MediaInfoGrabber.App</StartupObject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- erst alles rauswerfen ... -->
+    <Compile Remove="**\*.cs" />
+    <!-- ... und nur unsere Datei reinnehmen -->
+    <Compile Include="proj.cs" />
+  </ItemGroup>
+</Project>
