@@ -8,10 +8,13 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text.Json.Nodes;
 using Windows.Media.Control;
 using Windows.Storage.Streams;
 
@@ -23,6 +26,7 @@ namespace MediaInfoGrabber
         {
             bool compactMode = false;
             bool portableMode = false;
+            bool restOnly = false;
             int port = 8080;
             string? appFilter = null;
             
@@ -35,6 +39,9 @@ namespace MediaInfoGrabber
                         break;
                     case "--portable":
                         portableMode = true;
+                        break;
+                    case "--restonly":
+                        restOnly = true;
                         break;
                     case "--port":
                         if (i + 1 < args.Length && int.TryParse(args[i + 1], out int parsedPort))
@@ -53,7 +60,7 @@ namespace MediaInfoGrabber
                 }
             }
             
-            await new MediaInfoGrabber(compactMode, portableMode, port, appFilter).RunAsync();
+            await new MediaInfoGrabber(compactMode, portableMode, restOnly, port, appFilter).RunAsync();
         }
     }
 
@@ -91,6 +98,7 @@ namespace MediaInfoGrabber
         readonly string CoverPath;
         readonly bool CompactMode;
         readonly bool PortableMode;
+        readonly bool RestOnly;
         readonly int Port;
         readonly string? AppFilter;
 
@@ -104,12 +112,28 @@ namespace MediaInfoGrabber
         HttpListener? webServer;
         string? currentJsonData;
         byte[]? currentCoverData;
+        string? currentApiJsonData;
+        string? currentApiEtag;
+        string? currentCoverEtag;
+        DateTimeOffset lastCaptureAt = DateTimeOffset.MinValue;
+        bool lastMetadataIncomplete = true;
         static readonly HttpClient httpClient = new HttpClient();
 
-        public MediaInfoGrabber(bool compactMode = false, bool portableMode = false, int port = 8080, string? appFilter = null)
+        static readonly TimeSpan EnrichTtl = TimeSpan.FromHours(6);
+        readonly ConcurrentDictionary<string, (DateTimeOffset ts, EnrichedData data)> enrichCache = new();
+        readonly ConcurrentDictionary<string, Task<EnrichedData>> enrichInflight = new();
+
+        sealed class EnrichedData
+        {
+            public string? year { get; init; }
+            public string[] genres { get; init; } = Array.Empty<string>();
+        }
+
+        public MediaInfoGrabber(bool compactMode = false, bool portableMode = false, bool restOnly = false, int port = 8080, string? appFilter = null)
         {
             CompactMode = compactMode;
             PortableMode = portableMode;
+            RestOnly = restOnly;
             Port = port;
             AppFilter = appFilter;
             JsonPath  = Path.Combine(Root, "nowplaying.json");
@@ -129,7 +153,7 @@ namespace MediaInfoGrabber
                 catch { } 
             };
 
-            if (!PortableMode)
+            if (!PortableMode && !RestOnly)
             {
                 AtomicIO.WriteText(JsonPath, @"{""status"":""Starting""}");
             }
@@ -138,9 +162,11 @@ namespace MediaInfoGrabber
                 currentJsonData = @"{""status"":""Starting""}"; 
             }
 
+            currentApiJsonData = currentJsonData;
+
             filters = new FilterConfig(Root, AppFilter);
 
-            if (!PortableMode)
+            if (!PortableMode && !RestOnly)
             {
                 if (CompactMode)
                 {
@@ -159,11 +185,21 @@ namespace MediaInfoGrabber
 
         public async Task RunAsync()
         {
-            if (PortableMode)
+            StartWebServer();
+            if (RestOnly)
             {
-                StartWebServer();
+                Console.WriteLine($"REST-only mode: Web server started on http://localhost:{Port}");
+                Console.WriteLine($"Get data at: http://localhost:{Port}/api/v1/getdata");
+            }
+            else if (PortableMode)
+            {
                 Console.WriteLine($"Portable mode: Web server started on http://localhost:{Port}");
                 Console.WriteLine($"Access overlay at: http://localhost:{Port}/overlay.html");
+            }
+            else
+            {
+                Console.WriteLine($"REST mode: Web server started on http://localhost:{Port}");
+                Console.WriteLine($"Get data at: http://localhost:{Port}/api/v1/getdata");
             }
             
             mgr = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
@@ -225,6 +261,11 @@ namespace MediaInfoGrabber
                 {
                     case "":
                     case "overlay.html":
+                        if (RestOnly)
+                        {
+                            response.StatusCode = 404;
+                            break;
+                        }
                         response.ContentType = "text/html; charset=utf-8";
                         var html = CompactMode ? OverlayAssets.CompactHtml : OverlayAssets.Html;
                         var htmlBytes = Encoding.UTF8.GetBytes(html);
@@ -233,6 +274,11 @@ namespace MediaInfoGrabber
                         break;
                         
                     case "overlay.css":
+                        if (RestOnly)
+                        {
+                            response.StatusCode = 404;
+                            break;
+                        }
                         if (!CompactMode)
                         {
                             response.ContentType = "text/css; charset=utf-8";
@@ -247,6 +293,11 @@ namespace MediaInfoGrabber
                         break;
                         
                     case "overlay.js":
+                        if (RestOnly)
+                        {
+                            response.StatusCode = 404;
+                            break;
+                        }
                         if (!CompactMode)
                         {
                             response.ContentType = "application/javascript; charset=utf-8";
@@ -259,8 +310,64 @@ namespace MediaInfoGrabber
                             response.StatusCode = 404;
                         }
                         break;
+
+                    case "api/v1/getdata":
+                        response.ContentType = "application/json; charset=utf-8";
+                        response.Headers.Add("Cache-Control", "no-store");
+                        response.Headers.Add("Access-Control-Allow-Credentials", "true");
+
+                        // On-demand refresh: if clients are polling and metadata is incomplete,
+                        // re-query SMTC (throttled) so album/cover can fill in once the app provides it.
+                        if (lastMetadataIncomplete)
+                        {
+                            var age = DateTimeOffset.UtcNow - lastCaptureAt;
+                            if (age > TimeSpan.FromMilliseconds(750))
+                            {
+                                lastCaptureAt = DateTimeOffset.UtcNow;
+                                _ = Task.Run(async () =>
+                                {
+                                    try { await WriteNowPlayingAsync(); } catch { }
+                                });
+                            }
+                        }
+
+                        var apiJson = GetLiveApiJson();
+                        var apiBytes = Encoding.UTF8.GetBytes(apiJson);
+                        response.ContentLength64 = apiBytes.Length;
+                        response.OutputStream.Write(apiBytes, 0, apiBytes.Length);
+                        break;
+
+                    case "api/v1/cover":
+                        if (currentCoverData != null)
+                        {
+                            response.ContentType = "image/jpeg";
+                            response.Headers.Add("Cache-Control", "no-store");
+                            var coverEtag = currentCoverEtag;
+                            if (!string.IsNullOrEmpty(coverEtag))
+                            {
+                                var inm = request.Headers["If-None-Match"];
+                                if (!string.IsNullOrEmpty(inm) && string.Equals(inm, coverEtag, StringComparison.Ordinal))
+                                {
+                                    response.StatusCode = 304;
+                                    break;
+                                }
+                                response.Headers.Add("ETag", coverEtag);
+                            }
+                            response.ContentLength64 = currentCoverData.Length;
+                            response.OutputStream.Write(currentCoverData, 0, currentCoverData.Length);
+                        }
+                        else
+                        {
+                            response.StatusCode = 404;
+                        }
+                        break;
                         
                     case "nowplaying.json":
+                        if (RestOnly)
+                        {
+                            response.StatusCode = 404;
+                            break;
+                        }
                         response.ContentType = "application/json; charset=utf-8";
                         response.Headers.Add("Cache-Control", "no-store");
                         // Additional CORS headers for JSON endpoint
@@ -272,6 +379,11 @@ namespace MediaInfoGrabber
                         break;
                         
                     case "cover.jpg":
+                        if (RestOnly)
+                        {
+                            response.StatusCode = 404;
+                            break;
+                        }
                         if (currentCoverData != null)
                         {
                             response.ContentType = "image/jpeg";
@@ -285,6 +397,11 @@ namespace MediaInfoGrabber
                         break;
                         
                     case "usage.md":
+                        if (RestOnly)
+                        {
+                            response.StatusCode = 404;
+                            break;
+                        }
                         response.ContentType = "text/markdown; charset=utf-8";
                         var usageBytes = Encoding.UTF8.GetBytes(OverlayAssets.UsageMd);
                         response.ContentLength64 = usageBytes.Length;
@@ -326,6 +443,66 @@ namespace MediaInfoGrabber
             finally
             {
                 response.Close();
+            }
+        }
+
+        string GetLiveApiJson()
+        {
+            var raw = currentApiJsonData ?? currentJsonData;
+            if (string.IsNullOrEmpty(raw))
+                return @"{""status"":""Stopped""}";
+
+            try
+            {
+                var node = JsonNode.Parse(raw) as JsonObject;
+                if (node is null)
+                    return raw;
+
+                var now = DateTimeOffset.UtcNow;
+                node["server_time"] = now.ToString("o");
+
+                var isPlaying = false;
+                if (node.TryGetPropertyValue("is_playing", out var playingNode) && playingNode is JsonValue pv && pv.TryGetValue<bool>(out var b))
+                    isPlaying = b;
+
+                var durationMs = 0;
+                if (node.TryGetPropertyValue("duration_ms", out var durNode) && durNode is JsonValue dv && dv.TryGetValue<int>(out var di))
+                    durationMs = di;
+
+                var baseMs = 0;
+                if (node.TryGetPropertyValue("progress_base_ms", out var baseNode) && baseNode is JsonValue bv && bv.TryGetValue<int>(out var bi))
+                    baseMs = bi;
+                else if (node.TryGetPropertyValue("progress_ms", out var progNode) && progNode is JsonValue pr && pr.TryGetValue<int>(out var pi))
+                    baseMs = pi;
+
+                DateTimeOffset baseAt = now;
+                if (node.TryGetPropertyValue("progress_base_at", out var atNode) && atNode is JsonValue av && av.TryGetValue<string>(out var atStr))
+                {
+                    if (DateTimeOffset.TryParse(atStr, out var parsed))
+                        baseAt = parsed;
+                }
+
+                var live = baseMs;
+                if (isPlaying)
+                {
+                    var delta = now - baseAt;
+                    if (delta > TimeSpan.Zero)
+                        live = baseMs + (int)Math.Round(delta.TotalMilliseconds);
+                }
+
+                if (durationMs > 0)
+                    live = Math.Max(0, Math.Min(durationMs, live));
+
+                node["progress_ms"] = live;
+                return node.ToJsonString(new JsonSerializerOptions
+                {
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+                    WriteIndented = false
+                });
+            }
+            catch
+            {
+                return raw;
             }
         }
         
@@ -447,10 +624,170 @@ namespace MediaInfoGrabber
                 currentCoverData = null;
                 currentJsonData = @"{""status"":""Stopped""}";
             }
-            else
+            else if (!RestOnly)
             {
                 AtomicIO.TryDelete(CoverPath);
                 AtomicIO.WriteText(JsonPath, @"{""status"":""Stopped""}");
+            }
+            else
+            {
+                currentCoverData = null;
+            }
+
+            currentApiJsonData = currentJsonData ?? @"{""status"":""Stopped""}";
+            currentApiEtag = null;
+            currentCoverEtag = null;
+        }
+
+        static string EnrichKey(string title, string artist, string album)
+            => $"mb:{title}::{artist}::{album}".ToLowerInvariant();
+
+        async Task<EnrichedData> EnsureEnrichmentAsync(string? title, string? artist, string? album)
+        {
+            var safeTitle = title ?? "";
+            var safeArtist = artist ?? "";
+            var safeAlbum = album ?? "";
+
+            if (string.IsNullOrWhiteSpace(safeTitle) || string.IsNullOrWhiteSpace(safeArtist) || string.IsNullOrWhiteSpace(safeAlbum))
+            {
+                return new EnrichedData { year = null, genres = Array.Empty<string>() };
+            }
+
+            var key = EnrichKey(safeTitle, safeArtist, safeAlbum);
+            if (enrichCache.TryGetValue(key, out var cached) && DateTimeOffset.UtcNow - cached.ts <= EnrichTtl)
+            {
+                return cached.data;
+            }
+
+            return await enrichInflight.GetOrAdd(key, __ => Task.Run(async () =>
+            {
+                try
+                {
+                    var data = await FetchMusicBrainzEnrichmentAsync(safeTitle, safeArtist, safeAlbum);
+                    enrichCache[key] = (DateTimeOffset.UtcNow, data);
+                    return data;
+                }
+                finally
+                {
+                    enrichInflight.TryRemove(key, out _);
+                }
+            }));
+        }
+
+        static string PrimaryArtist(string artist)
+        {
+            if (string.IsNullOrWhiteSpace(artist)) return "";
+            return artist.Split(new[] { ';', ',' }, 2)[0].Trim();
+        }
+
+        static string? BuildReleaseGroupQuery(string artist, string album)
+        {
+            if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(album)) return null;
+            var q = $"releasegroup:{album} AND artist:{artist}";
+            return $"?query={Uri.EscapeDataString(q)}&fmt=json&limit=1";
+        }
+
+        static string? BuildRecordingQuery(string artist, string title)
+        {
+            if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(title)) return null;
+            var q = $"recording:{title} AND artist:{artist}";
+            return $"?query={Uri.EscapeDataString(q)}&fmt=json&limit=1";
+        }
+
+        async Task<EnrichedData> FetchMusicBrainzEnrichmentAsync(string title, string artist, string album)
+        {
+            try
+            {
+                var mainArtist = PrimaryArtist(artist ?? "");
+                var rgQuery = BuildReleaseGroupQuery(mainArtist, album ?? "");
+                var recQuery = BuildRecordingQuery(mainArtist, title ?? "");
+
+                string? rgYear = null;
+                var rgGenres = new List<string>();
+                if (!string.IsNullOrEmpty(rgQuery))
+                {
+                    var url = $"https://musicbrainz.org/ws/2/release-group/{rgQuery}";
+                    using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                    req.Headers.TryAddWithoutValidation("User-Agent", "MediaInfoGrabber/1.0");
+                    req.Headers.TryAddWithoutValidation("Accept", "application/json");
+                    using var resp = await httpClient.SendAsync(req);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        using var stream = await resp.Content.ReadAsStreamAsync();
+                        using var doc = await JsonDocument.ParseAsync(stream);
+                        if (doc.RootElement.TryGetProperty("release-groups", out var rgs) && rgs.ValueKind == JsonValueKind.Array && rgs.GetArrayLength() > 0)
+                        {
+                            var hit = rgs[0];
+                            if (hit.TryGetProperty("first-release-date", out var frd) && frd.ValueKind == JsonValueKind.String)
+                            {
+                                var v = frd.GetString() ?? "";
+                                rgYear = v.Length >= 4 ? v.Substring(0, 4) : null;
+                            }
+                            if (hit.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Array)
+                            {
+                                foreach (var t in tags.EnumerateArray())
+                                {
+                                    if (t.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String)
+                                    {
+                                        var g = name.GetString();
+                                        if (!string.IsNullOrWhiteSpace(g)) rgGenres.Add(g);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                string? recYear = null;
+                var recGenres = new List<string>();
+                if (!string.IsNullOrEmpty(recQuery))
+                {
+                    var url = $"https://musicbrainz.org/ws/2/recording/{recQuery}";
+                    using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                    req.Headers.TryAddWithoutValidation("User-Agent", "MediaInfoGrabber/1.0");
+                    req.Headers.TryAddWithoutValidation("Accept", "application/json");
+                    using var resp = await httpClient.SendAsync(req);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        using var stream = await resp.Content.ReadAsStreamAsync();
+                        using var doc = await JsonDocument.ParseAsync(stream);
+                        if (doc.RootElement.TryGetProperty("recordings", out var recs) && recs.ValueKind == JsonValueKind.Array && recs.GetArrayLength() > 0)
+                        {
+                            var hit = recs[0];
+                            if (hit.TryGetProperty("first-release-date", out var frd) && frd.ValueKind == JsonValueKind.String)
+                            {
+                                var v = frd.GetString() ?? "";
+                                recYear = v.Length >= 4 ? v.Substring(0, 4) : null;
+                            }
+                            if (hit.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Array)
+                            {
+                                foreach (var t in tags.EnumerateArray())
+                                {
+                                    if (t.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String)
+                                    {
+                                        var g = name.GetString();
+                                        if (!string.IsNullOrWhiteSpace(g)) recGenres.Add(g);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                var year = rgYear ?? recYear;
+                var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var g in rgGenres) set.Add(g);
+                foreach (var g in recGenres) set.Add(g);
+
+                return new EnrichedData
+                {
+                    year = year,
+                    genres = set.Count == 0 ? Array.Empty<string>() : new List<string>(set).ToArray()
+                };
+            }
+            catch
+            {
+                return new EnrichedData { year = null, genres = Array.Empty<string>() };
             }
         }
 
@@ -472,6 +809,10 @@ namespace MediaInfoGrabber
                 var title  = info.Title      ?? "";
                 var album  = info.AlbumTitle ?? "";
 
+                var metaIncomplete = string.IsNullOrWhiteSpace(title)
+                    || string.IsNullOrWhiteSpace(artist)
+                    || string.IsNullOrWhiteSpace(album);
+
                 var durMs  = timeline.EndTime.TotalMilliseconds;
                 var posMs  = timeline.Position.TotalMilliseconds;
 
@@ -489,11 +830,10 @@ namespace MediaInfoGrabber
                             var bytes = new byte[(int)ras.Size];
                             reader.ReadBytes(bytes);
                             
-                            if (PortableMode)
-                            {
-                                currentCoverData = bytes;
-                            }
-                            else
+                            currentCoverData = bytes;
+                            currentCoverEtag = '"' + Convert.ToHexString(SHA256.HashData(bytes)) + '"';
+
+                            if (!PortableMode && !RestOnly)
                             {
                                 AtomicIO.WriteBytes(CoverPath, bytes);
                             }
@@ -504,16 +844,18 @@ namespace MediaInfoGrabber
                 }
                 if (!coverOK)
                 {
-                    if (PortableMode)
-                    {
-                        currentCoverData = null;
-                    }
-                    else
+                    currentCoverData = null;
+                    currentCoverEtag = null;
+                    if (!PortableMode && !RestOnly)
                     {
                         AtomicIO.TryDelete(CoverPath);
                     }
                 }
 
+                lastMetadataIncomplete = metaIncomplete || !coverOK;
+                lastCaptureAt = DateTimeOffset.UtcNow;
+
+                var now = DateTimeOffset.UtcNow;
                 var payload = new
                 {
                     status = status.ToString(),
@@ -523,8 +865,33 @@ namespace MediaInfoGrabber
                     album,
                     duration_ms = (int)Math.Round(durMs),
                     progress_ms = (int)Math.Round(posMs),
+                    progress_base_ms = (int)Math.Round(posMs),
+                    progress_base_at = now.ToString("o"),
+                    server_time = now.ToString("o"),
                     app_id = s.SourceAppUserModelId,
                     cover_path = coverOK ? "cover.jpg" : null,
+                    updated_at = DateTimeOffset.Now.ToString("o")
+                };
+
+                var enrichment = await EnsureEnrichmentAsync(title, artist, album);
+
+                var apiPayload = new
+                {
+                    status = status.ToString(),
+                    is_playing = isPlaying,
+                    title,
+                    artist,
+                    album,
+                    duration_ms = (int)Math.Round(durMs),
+                    progress_ms = (int)Math.Round(posMs),
+                    progress_base_ms = (int)Math.Round(posMs),
+                    progress_base_at = now.ToString("o"),
+                    server_time = now.ToString("o"),
+                    app_id = s.SourceAppUserModelId,
+                    cover_url = coverOK ? "/api/v1/cover" : null,
+                    cover_etag = coverOK ? currentCoverEtag : null,
+                    year = enrichment.year,
+                    genres = enrichment.genres,
                     updated_at = DateTimeOffset.Now.ToString("o")
                 };
 
@@ -538,10 +905,18 @@ namespace MediaInfoGrabber
                 {
                     currentJsonData = jsonString;
                 }
-                else
+                else if (!RestOnly)
                 {
                     AtomicIO.WriteText(JsonPath, jsonString);
                 }
+
+                currentApiJsonData = JsonSerializer.Serialize(apiPayload, new JsonSerializerOptions
+                {
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+                    WriteIndented = false
+                });
+
+                currentApiEtag = '"' + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(currentApiJsonData))) + '"';
             }
             catch
             {
@@ -685,7 +1060,7 @@ body.use-fade #player.is-leaving.fx  { animation: flyOut var(--anim-dur) cubic-b
     --interval-ms: 0;            /* repeat interval (0 = no repeat) */
     --skip-settle-ms: 0;         /* time to wait before committing to a track */
     --enrich-meta: 1;            /* metadata enrichment (1 = enabled, 0 = disabled) */
-    --poll-ms: 500;              /* polling interval */
+    --poll-ms: 200;              /* polling interval */
 
     /* ========== Title Bar Configuration ========== */
     --title-bar-text: '';                           /* Empty = hidden, 'Your text here' = shown */
@@ -1075,7 +1450,7 @@ function loadConfig() {
         distPx:       parseFloat(getCssVar('--fly-dist', '1600')),
         durationMs:   parseMs(getCssVar('--duration-ms', '0')),
         intervalMs:   parseMs(getCssVar('--interval-ms', '0')),
-        pollMs:       parseMs(getCssVar('--poll-ms', '1000ms')),
+        pollMs:       parseMs(getCssVar('--poll-ms', '200ms')),
         settleMs:     parseMs(getCssVar('--skip-settle-ms', '0ms')),
         titleBarText: getCssVar('--title-bar-text', '').replace(/^[""']|[""']$/g, ''),
         titleBarAlign: getCssVar('--title-bar-align', 'center'),
@@ -1285,12 +1660,15 @@ function updateLiveBits(track) {
     const durationMs = Math.max(1, track.duration_ms || 0);
     ui.duration.textContent = msToMinSec(durationMs);
 
-    const updatedAt = track.updated_at ? Date.parse(track.updated_at) : Date.now();
-    const isStale = Date.now() - updatedAt > 5000;
+    const baseAt = track.progress_base_at
+        ? Date.parse(track.progress_base_at)
+        : (track.updated_at ? Date.parse(track.updated_at) : Date.now());
+    const baseMs = (track.progress_base_ms ?? track.progress_ms ?? 0);
+    const isStale = Date.now() - baseAt > 5000;
 
     let elapsedMs = isPaused || isStale
-        ? (track.progress_ms || 0)
-        : (track.progress_ms || 0) + (Date.now() - updatedAt);
+        ? baseMs
+        : baseMs + (Date.now() - baseAt);
 
     let lastNow = performance.now();
     const tick = (now) => {
@@ -1885,6 +2263,42 @@ public static string UsageMd = @"# 🎨 MediaInfoGrabber Widget Customization Gu
   1. Add **Browser Source**
   2. Point to `overlay.html` file
   3. Set custom CSS if needed
+  
+  ## 🔌 REST API (for external tools)
+  
+  MediaInfoGrabber exposes a REST API that you can poll from any tool to retrieve the latest now-playing information.
+  
+  **Base URL:** `http://localhost:8080` (change using `--port`)
+  
+  ### Modes
+  
+  - Default: Writes overlay files to disk and also starts the REST server.
+  - `--portable`: No file writes; serves overlay + data via HTTP.
+  - `--restonly`: REST API only (no overlay pages/assets; no files written).
+  
+  ### Endpoints
+  
+  - `GET /api/v1/getdata`
+    - Returns the latest *enriched* payload as JSON
+    - Uses HTTP `ETag` so high-frequency polling is cheap
+  
+  - `GET /api/v1/cover`
+    - Returns the current album artwork as `image/jpeg`
+    - Uses HTTP `ETag` as well
+  
+  ### Recommended polling (important)
+  
+  For 200ms polling, always use `ETag` + `If-None-Match`:
+  
+  1. Call `/api/v1/getdata`
+  2. Store the `ETag` response header
+  3. Next call, send `If-None-Match: <etag>`
+  4. If response is `304 Not Modified`, do nothing
+  
+  Cover handling:
+  
+  - The JSON contains `cover_url` and `cover_etag`
+  - Only re-request `/api/v1/cover` if `cover_etag` changed (or you don't have a cover yet)
   
   For complete documentation, visit the usage.md file created alongside the overlay files.
   ";

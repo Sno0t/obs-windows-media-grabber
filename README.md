@@ -15,6 +15,8 @@ MediaInfoGrabber monitors Windows Media Session (SMTC - System Media Transport C
 
 For portable mode (no files): `MediaInfoGrabber.exe --portable` → Open `http://localhost:8080/overlay.html`
 
+For REST API consumers: `http://localhost:8080/api/v1/getdata` (REST server is enabled by default)
+
 ## ✨ Features
 
 - **🎧 Real-time Media Monitoring**: Automatically detects media from Spotify, YouTube, VLC, and other SMTC-compatible applications
@@ -84,6 +86,64 @@ Runs an internal web server instead of creating files on disk. Perfect for:
 - `/nowplaying.json` - Real-time media data
 - `/cover.jpg` - Current album artwork
 - `/usage.md` - Documentation
+
+### 🔌 REST API (Enabled by Default)
+
+MediaInfoGrabber starts an internal HTTP server by default (same port as portable mode, default `8080`) and exposes a stable REST API that returns the latest media info as JSON. This is intended for:
+
+- Multiple independent consumers (OBS overlays, dashboards, stream bots)
+- High-frequency polling (e.g. 200ms) without excessive bandwidth/CPU, via HTTP `ETag` + `304 Not Modified`
+
+#### REST-only Mode
+
+```bash
+MediaInfoGrabber.exe --restonly [--port 8080] [--app spotify]
+```
+
+In `--restonly` mode:
+
+- The REST API is available
+- No overlay pages/assets are served
+- No files are written to disk
+
+#### Endpoints
+
+- `GET /api/v1/getdata`
+  - Returns the latest *enriched* now-playing payload as JSON
+  - Response headers:
+    - `ETag: "..."`
+  - Request headers:
+    - `If-None-Match: "..."` → server responds `304 Not Modified` if unchanged
+
+- `GET /api/v1/cover`
+  - Returns the current cover image (`image/jpeg`)
+  - Response headers:
+    - `ETag: "..."`
+  - Request headers:
+    - `If-None-Match: "..."` → server responds `304 Not Modified` if unchanged
+
+#### Payload fields
+
+`GET /api/v1/getdata` returns fields like:
+
+- `status` (`Playing`, `Paused`, `Stopped`)
+- `is_playing` (`true`/`false`)
+- `title`, `artist`, `album`
+- `duration_ms`, `progress_ms`
+- `app_id`
+- `year`, `genres[]` (MusicBrainz enrichment)
+- `cover_url` (usually `/api/v1/cover` when artwork is available)
+- `cover_etag` (lets clients decide whether to refresh cover)
+- `updated_at` (ISO timestamp)
+
+#### Recommended polling behavior (important for 200ms polling)
+
+- Cache the `ETag` from `/api/v1/getdata` and send it back using `If-None-Match`
+- If the response is `304`, skip JSON parsing and UI updates
+- Only fetch `/api/v1/cover` when:
+  - the track changed, or
+  - `cover_etag` changed, or
+  - your cover request returns `200` instead of `304`
 
 **Examples:**
 ```bash
